@@ -21,7 +21,7 @@ MindRAG is a powerful Retrieval-Augmented Generation (RAG) system that allows yo
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yourusername/mindrag.git
+   git clone https://github.com/ANJAN672/MindRag_vGPU.git
    cd mindrag
    ```
 
