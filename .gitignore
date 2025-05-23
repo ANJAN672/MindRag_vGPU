@@ -1,0 +1,38 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+
+# Checkpoints and temp
+.ipynb_checkpoints/
+
+# VSCode and OS files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Node modules (frontend)
+/frontend/node_modules/
+dist/
+
+# Model weights (deep in folders too)
+**/*.pt
+**/*.bin
+**/*.onnx
+**/*.pb
+**/*.ckpt
+**/*.faiss
+**/*.npz
+
+# Documents (large demo/test files)
+**/*.pdf
+**/*.docx
+**/*.pptx
+
+# Optional: ignore any folder named "models"
+models/
+**/models/

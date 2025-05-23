@@ -1,0 +1,523 @@
+import { useState, useCallback, useEffect } from "react";
+import {
+  Box,
+  Button,
+  Flex,
+  Heading,
+  Text,
+  VStack,
+  HStack,
+  useToast,
+  Progress,
+  Badge,
+  Icon,
+  List,
+  ListItem,
+  useColorModeValue,
+  Spinner,
+  AlertDialog,
+  AlertDialogBody,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogContent,
+  AlertDialogOverlay,
+  useDisclosure,
+} from "@chakra-ui/react";
+import { useDropzone } from "react-dropzone";
+import { FiUpload, FiFile, FiCheckCircle, FiXCircle, FiTrash2 } from "react-icons/fi";
+import axios from "axios";
+
+/**
+ * Component for uploading documents and displaying previously uploaded documents.
+ * Integrates with a backend API for upload, listing, and deletion.
+ * Uses Chakra UI for styling and react-dropzone for drag-and-drop functionality.
+ */
+const DocumentUploader = ({ onDocumentsUploaded }) => {
+  // --- State Management ---
+  const [files, setFiles] = useState([]); // Files selected for upload
+  const [uploading, setUploading] = useState(false); // Upload in progress state
+  const [uploadProgress, setUploadProgress] = useState(0); // Overall upload progress (for multiple files)
+  const [uploadedFiles, setUploadedFiles] = useState([]); // List of documents already uploaded and processed
+  const [loadingDocuments, setLoadingDocuments] = useState(true); // State for initially loading existing documents
+  const [deleteId, setDeleteId] = useState(null); // ID of the document to be deleted (for confirmation dialog)
+
+  // --- Chakra UI Hooks ---
+  const { isOpen, onOpen, onClose } = useDisclosure(); // Hook for AlertDialog state
+  const toast = useToast(); // Hook for displaying notifications
+
+  // --- Color Mode Hooks for Styling ---
+  const borderColor = useColorModeValue("blue.300", "blue.500");
+  const hoverBg = useColorModeValue("blue.50", "blue.900");
+  const activeBg = useColorModeValue("blue.100", "blue.800");
+
+  // --- Effects ---
+  // Fetch existing documents on component mount
+  useEffect(() => {
+    fetchDocuments();
+  }, []);
+
+  // --- API Interaction Functions ---
+
+  /**
+   * Fetches the list of uploaded documents from the backend.
+   */
+  const fetchDocuments = async () => {
+    setLoadingDocuments(true);
+    try {
+      const response = await axios.get("/api/documents");
+
+      // Check if documents exist and is a valid array
+      if (response.data && Array.isArray(response.data.documents)) {
+        setUploadedFiles(response.data.documents.map(doc => ({
+          ...doc,
+          status: "processed", // Assume fetched documents are processed
+          chunks: doc.chunks || "N/A" // Use actual chunks if available, else N/A
+        })));
+      } else {
+        // If no documents or invalid response structure, set empty array
+        setUploadedFiles([]);
+      }
+    } catch (error) {
+      console.error("Error fetching documents:", error);
+      setUploadedFiles([]); // Set to empty array on error
+
+      // Show error toast only if not initial loading and not a 404 (no documents)
+      if (!loadingDocuments && error.response?.status !== 404) {
+         // Check for network error (backend offline)
+         if (!error.response) {
+             console.log("Backend appears to be offline, silently setting empty documents");
+         } else {
+            toast({
+              title: "Error fetching documents",
+              description: "Could not load your documents. The server might be starting up.",
+              status: "warning",
+              duration: 3000,
+              isClosable: true,
+            });
+         }
+      }
+    } finally {
+      setLoadingDocuments(false);
+    }
+  };
+
+  /**
+   * Handles file drop/selection, filters supported types, and adds to state.
+   * Memoized using useCallback.
+   */
+  const onDrop = useCallback((acceptedFiles) => {
+    // Filter for supported file types based on MIME type and extensions
+    const supportedFiles = acceptedFiles.filter(
+      (file) =>
+        file.type === "text/plain" ||
+        file.type === "application/pdf" ||
+        file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || // .docx
+        file.type === "application/msword" || // .doc
+        file.type === "application/vnd.openxmlformats-officedocument.presentationml.presentation" || // .pptx
+        file.type === "application/vnd.ms-powerpoint" // .ppt
+    );
+
+    // Notify user if unsupported files were filtered out
+    if (supportedFiles.length < acceptedFiles.length) {
+      toast({
+        title: "Unsupported file type",
+        description: "Only .txt, .pdf, .docx, .doc, .pptx, and .ppt files are currently supported.",
+        status: "warning",
+        duration: 5000,
+        isClosable: true,
+      });
+    }
+
+    // Add supported files to the list of files to be uploaded
+    setFiles((prevFiles) => [...prevFiles, ...supportedFiles]);
+  }, [toast]); // Dependency array includes toast
+
+  // --- React Dropzone Hook ---
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop, // Assign the onDrop handler
+    accept: { // Define accepted file types
+      "text/plain": [".txt"],
+      "application/pdf": [".pdf"],
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
+      "application/msword": [".doc"],
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation": [".pptx"],
+      "application/vnd.ms-powerpoint": [".ppt"],
+    }
+  });
+
+  /**
+   * Uploads selected files to the backend one by one.
+   * Tracks progress and provides feedback via toasts.
+   */
+  const uploadFiles = async () => {
+    if (files.length === 0) return; // Do nothing if no files are selected
+
+    setUploading(true);
+    setUploadProgress(0);
+
+    const uploadResults = [];
+    let successCount = 0;
+    let failCount = 0;
+
+    try {
+      // Iterate and upload each file
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const formData = new FormData();
+        formData.append("file", file);
+
+        // Update base progress before starting current file upload
+        const fileProgressBase = (i / files.length) * 100;
+        setUploadProgress(fileProgressBase);
+
+        // Set a timeout for the request to prevent indefinite hanging
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+           controller.abort(); // Abort the request after timeout
+           console.warn(`Upload timeout for file: ${file.name}`);
+        }, 120000); // 2 minute timeout
+
+        try {
+          const response = await axios.post("/api/documents/upload", formData, {
+            headers: {
+              "Content-Type": "multipart/form-data",
+            },
+            signal: controller.signal, // Link abort controller to request
+            onUploadProgress: (progressEvent) => {
+              // Calculate overall progress considering current file's upload progress
+              const fileWeight = 100 / files.length;
+              const currentFileProgress = (progressEvent.loaded / progressEvent.total) * fileWeight;
+              const overallProgress = fileProgressBase + currentFileProgress;
+              setUploadProgress(Math.min(overallProgress, 99)); // Cap at 99% before final step
+            }
+          });
+
+          clearTimeout(timeoutId); // Clear timeout if request finishes
+
+          // Process successful upload response
+          successCount++;
+          uploadResults.push({
+            filename: file.name,
+            status: "processed",
+            size: file.size,
+            ...response.data // Include backend data (like id, chunks)
+          });
+
+        } catch (fileError) {
+          clearTimeout(timeoutId); // Clear timeout even on file error
+
+          // Process failed upload
+          failCount++;
+          console.error(`Upload failed for file ${file.name}:`, fileError);
+          uploadResults.push({
+            filename: file.name,
+            status: "error",
+            message: fileError.response?.data?.detail || fileError.message || "Upload failed"
+          });
+        }
+      }
+
+      // Set final progress to 100%
+      setUploadProgress(100);
+
+      // Show summary toasts
+      if (successCount > 0) {
+        toast({
+          title: `${successCount} document${successCount > 1 ? "s" : ""} uploaded successfully`,
+          status: "success",
+          duration: 5000,
+          isClosable: true,
+        });
+      }
+
+      if (failCount > 0) {
+        toast({
+          title: `${failCount} document${failCount > 1 ? "s" : ""} failed to upload`,
+          description: "Check console for details.", // Simple message for user
+          status: "error",
+          duration: 7000, // Longer duration for error summary
+          isClosable: true,
+        });
+      }
+
+      // Refresh the list of uploaded documents from the server
+      await fetchDocuments();
+
+      // Notify parent component with successful uploads
+      if (onDocumentsUploaded && typeof onDocumentsUploaded === "function") {
+        onDocumentsUploaded(uploadResults.filter(doc => doc.status === "processed"));
+      }
+
+      // Clear the list of selected files
+      setFiles([]);
+
+    } catch (error) {
+      console.error("Overall upload process error:", error);
+      // This catch block handles errors before per-file uploads start, or unexpected issues
+      toast({
+        title: "Upload process error",
+        description: "An unexpected error occurred during the upload process.",
+        status: "error",
+        duration: 5000,
+        isClosable: true,
+      });
+    } finally {
+      setUploading(false);
+      // Reset progress after a short delay to show 100%
+      setTimeout(() => setUploadProgress(0), 1000);
+    }
+  };
+
+  /**
+   * Opens the confirmation dialog for deleting a document.
+   * @param {string} id - The ID of the document to delete.
+   */
+  const confirmDelete = (id) => {
+    setDeleteId(id); // Store the ID
+    onOpen(); // Open the AlertDialog
+  };
+
+  /**
+   * Deletes the document using the stored deleteId after confirmation.
+   */
+  const deleteDocument = async () => {
+    if (!deleteId) return; // Should not happen if dialog is open, but safety check
+
+    try {
+      await axios.delete(`/api/documents/${deleteId}`); // Call delete API
+
+      // Optimistically update the UI
+      setUploadedFiles(prev => prev.filter(file => file.id !== deleteId));
+
+      toast({
+        title: "Document deleted",
+        description: "The document has been successfully deleted.",
+        status: "success",
+        duration: 3000,
+        isClosable: true,
+      });
+
+      // Re-fetch to ensure state is in sync with backend, especially for related data if any
+      fetchDocuments();
+
+    } catch (error) {
+      console.error("Error deleting document:", error);
+      // Revert UI change or re-fetch on error if optimistic update was done
+      // Or just show error and let user retry
+      toast({
+        title: "Error deleting document",
+        description: error.response?.data?.detail || "An error occurred while deleting the document.",
+        status: "error",
+        duration: 5000,
+        isClosable: true,
+      });
+      // Re-fetch to sync state after failure if optimistic update was used
+      fetchDocuments();
+    } finally {
+      onClose(); // Close the dialog
+      setDeleteId(null); // Clear the stored ID
+    }
+  };
+
+  /**
+   * Removes a file from the list of files selected for upload.
+   * @param {number} index - The index of the file to remove.
+   */
+  const removeFile = (index) => {
+    setFiles(prev => prev.filter((_, i) => i !== index));
+  };
+
+  // --- Rendered Component Structure ---
+  return (
+    <VStack spacing={6} align="stretch" w="100%">
+      {/* --- File Dropzone Area --- */}
+      <Box
+        {...getRootProps()} // Spread dropzone root props
+        p={6}
+        borderWidth={2}
+        borderRadius="lg"
+        borderStyle="dashed"
+        borderColor={isDragActive ? "blue.500" : borderColor} // Dynamic border color based on drag state
+        bg={isDragActive ? activeBg : "transparent"} // Dynamic background color
+        _hover={{ bg: hoverBg }} // Hover effect
+        cursor="pointer"
+        transition="all 0.2s"
+      >
+        <input {...getInputProps()} /> {/* Spread dropzone input props */}
+        <VStack spacing={2}>
+          <Icon as={FiUpload} boxSize={10} color="blue.500" /> {/* Upload icon */}
+          <Heading size="md">
+            {isDragActive ? "Drop files here" : "Drag & drop files here"} {/* Dynamic text */}
+          </Heading>
+          <Text color="gray.500">
+            or click to select files
+          </Text>
+          <Text fontSize="sm" color="gray.500" mt={2}>
+            Supported formats: .txt, .pdf, .docx, .doc, .pptx, .ppt {/* Supported formats info */}
+          </Text>
+        </VStack>
+      </Box>
+
+      {/* --- Selected Files List (to be uploaded) --- */}
+      {files.length > 0 && ( // Only show if there are files selected
+        <Box>
+          <Heading size="sm" mb={3}>
+            Selected Files ({files.length})
+          </Heading>
+          <List spacing={2}>
+            {files.map((file, index) => (
+              <ListItem
+                key={index} // Use index as key for temporary list
+                p={2}
+                borderWidth={1}
+                borderRadius="md"
+                display="flex"
+                justifyContent="space-between"
+                alignItems="center"
+              >
+                <HStack>
+                  <Icon as={FiFile} color="blue.500" /> {/* File icon */}
+                  <Text fontWeight="medium" isTruncated maxW="300px"> {/* Truncate long filenames */}
+                    {file.name}
+                  </Text>
+                  <Text fontSize="xs" color="gray.500">
+                    {(file.size / 1024).toFixed(1)} KB {/* Display file size in KB */}
+                  </Text>
+                </HStack>
+                <Button
+                  size="sm"
+                  colorScheme="red"
+                  variant="ghost"
+                  onClick={() => removeFile(index)} // Remove button
+                  leftIcon={<FiTrash2 />}
+                >
+                  Remove
+                </Button>
+              </ListItem>
+            ))}
+          </List>
+          {/* Upload Button */}
+          <Button
+            mt={4}
+            colorScheme="blue"
+            onClick={uploadFiles}
+            isLoading={uploading} // Show loading state
+            loadingText={`Uploading... ${uploadProgress.toFixed(0)}%`} // Show progress in loading text
+            isDisabled={files.length === 0 || uploading} // Disable if no files or already uploading
+            width="full"
+          >
+            Upload {files.length} {files.length === 1 ? "file" : "files"}
+          </Button>
+          {/* Upload Progress Bar */}
+          {uploading && (
+            <Progress
+              mt={2}
+              value={uploadProgress}
+              size="sm"
+              colorScheme="blue"
+              borderRadius="full"
+            />
+          )}
+        </Box>
+      )}
+
+      {/* --- Uploaded Documents List --- */}
+      <Box mt={6}>
+        <Heading size="md" mb={4}>
+          Uploaded Documents
+        </Heading>
+        {/* Loading Spinner */}
+        {loadingDocuments ? (
+          <Flex justify="center" py={8}>
+            <Spinner size="xl" color="blue.500" />
+          </Flex>
+        ) : uploadedFiles.length === 0 ? (
+          // Empty state message
+          <Box p={6} borderWidth={1} borderRadius="lg" textAlign="center">
+            <Text color="gray.500">No documents uploaded yet</Text>
+          </Box>
+        ) : (
+          // List of uploaded documents
+          <List spacing={3}>
+            {uploadedFiles.map((file) => (
+              <ListItem
+                key={file.id} // Use unique ID from backend as key
+                p={3}
+                borderWidth={1}
+                borderRadius="md"
+                boxShadow="sm"
+              >
+                <Flex justify="space-between" align="center">
+                  <HStack spacing={3}>
+                    {/* Status Icon (Check for success, X for error) */}
+                    <Icon
+                      as={file.status === "processed" ? FiCheckCircle : FiXCircle}
+                      color={file.status === "processed" ? "green.500" : "red.500"}
+                      boxSize={5}
+                    />
+                    <Box>
+                      <Text fontWeight="medium">{file.filename}</Text> {/* Filename */}
+                      <HStack spacing={2} mt={1}>
+                        {/* Status Badge */}
+                        <Badge colorScheme={file.status === "processed" ? "green" : "red"}>
+                          {file.status}
+                        </Badge>
+                        {/* Chunks Info Badge (if available and not N/A) */}
+                        {file.chunks && file.chunks !== "N/A" && (
+                          <Badge colorScheme="blue">{file.chunks} chunks</Badge>
+                        )}
+                        {/* File Size */}
+                         {file.size !== undefined && file.size !== null && ( // Ensure size exists
+                            <Text fontSize="xs" color="gray.500">
+                              {typeof file.size === "number" // Check if size is a number
+                               ? `${(file.size / 1024).toFixed(1)} KB`
+                               : file.size // Display as is if not a number (e.g., "N/A")
+                              }
+                           </Text>
+                         )}
+                      </HStack>
+                    </Box>
+                  </HStack>
+                  {/* Delete Button */}
+                  <Button
+                    size="sm"
+                    colorScheme="red"
+                    variant="ghost"
+                    onClick={() => confirmDelete(file.id)} // Open confirmation dialog
+                    leftIcon={<FiTrash2 />}
+                  >
+                    Delete
+                  </Button>
+                </Flex>
+              </ListItem>
+            ))}
+          </List>
+        )}
+      </Box>
+
+      {/* --- Delete Confirmation AlertDialog --- */}
+      <AlertDialog isOpen={isOpen} onClose={onClose} leastDestructiveRef={undefined}>
+        <AlertDialogOverlay>
+          <AlertDialogContent>
+            <AlertDialogHeader fontSize="lg" fontWeight="bold">
+              Delete Document
+            </AlertDialogHeader>
+
+            <AlertDialogBody>
+              Are you sure you want to delete this document? This action cannot be undone.
+            </AlertDialogBody>
+
+            <AlertDialogFooter>
+              <Button onClick={onClose}>Cancel</Button>
+              <Button colorScheme="red" onClick={deleteDocument} ml={3}>
+                Delete
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialogOverlay>
+      </AlertDialog>
+    </VStack>
+  );
+};
+
+export default DocumentUploader;

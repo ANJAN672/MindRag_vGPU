@@ -1,0 +1,758 @@
+import os
+import time
+import logging
+from typing import List, Dict, Optional, Any
+import torch
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEndpoint
+from langchain_huggingface import HuggingFacePipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from huggingface_hub import login
+import os
+from dotenv import load_dotenv
+
+# Import GPU utilities
+from app.core.gpu_utils import device_config
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Configuration ---
+# Get device settings from environment or gpu_utils
+DEVICE = os.environ.get("DEVICE", device_config.get('device', 'cuda'))
+HYBRID_MODE = os.environ.get("HYBRID_MODE", "false").lower() in ("true", "1", "yes")
+EMBEDDINGS_DEVICE = os.environ.get("EMBEDDINGS_DEVICE", DEVICE)
+
+# Force CUDA for embeddings if available and in hybrid mode
+if HYBRID_MODE and torch.cuda.is_available():
+    logger.info("Running in hybrid mode: GPU for embeddings, CPU for LLM")
+    EMBEDDINGS_DEVICE = "cuda"
+    # Ensure DEVICE for LLM is set to CPU in hybrid mode unless explicitly overridden
+    if os.environ.get("DEVICE") is None: # Only override if DEVICE wasn't set in .env
+         DEVICE = "cpu"
+         logger.info(f"Setting LLM device to CPU for hybrid mode as DEVICE not specified in .env")
+    else:
+         logger.info(f"Using DEVICE '{DEVICE}' from .env for LLM despite hybrid mode")
+
+
+# Directories for storing embeddings and models
+EMBEDDINGS_DIR = "data/embeddings"
+MODELS_DIR = "data/models"
+
+# Ensure necessary directories exist
+os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# --- Embeddings Model Initialization ---
+logger.info(f"Initializing embeddings model on {EMBEDDINGS_DEVICE} device")
+
+# Use larger batch size for GPU to improve performance
+batch_size = 64 if EMBEDDINGS_DEVICE == "cuda" else 32
+
+try:
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": EMBEDDINGS_DEVICE},
+        encode_kwargs={
+            "normalize_embeddings": True,
+            "device": EMBEDDINGS_DEVICE,
+            "batch_size": batch_size  # Larger batch size for GPU processing
+        },
+        show_progress=False  # Disable progress bar for faster processing
+    )
+    logger.info("Embeddings model initialized successfully.")
+except Exception as e:
+    logger.error(f"Error initializing embeddings model: {e}", exc_info=True)
+    # Handle the error - perhaps raise it or use a mock embeddings model
+    raise RuntimeError("Failed to initialize embeddings model.") from e
+
+
+# --- Language Model (LLM) Configuration ---
+# Get configuration from environment variables
+HF_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN", "")
+MODEL_TYPE = os.getenv("MODEL_TYPE", "local").lower() # Default to local, make lowercase
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "TheBloke/zephyr-7B-beta-GGUF") # Default local model
+MODEL_BASENAME = os.getenv("MODEL_BASENAME", "zephyr-7b-beta.Q2_K.gguf") # Default local model file
+
+# Get device configuration from gpu_utils if DEVICE was not set in .env
+if os.environ.get("DEVICE") is None:
+    DEVICE = device_config['device']
+    GPU_LAYERS = device_config['gpu_layers']
+else:
+    # If DEVICE was set in .env, use it and try to infer GPU layers if CUDA is available
+    if DEVICE == "cuda" and torch.cuda.is_available():
+        # Attempt to get GPU layers from gpu_utils if not set in env
+        GPU_LAYERS = int(os.getenv("GPU_LAYERS", device_config.get('gpu_layers', 0)))
+        if GPU_LAYERS == 0:
+             logger.warning("DEVICE set to cuda but GPU_LAYERS is 0 or not set. LLM will run on CPU.")
+    else:
+        GPU_LAYERS = 0 # No GPU layers if DEVICE is not cuda or cuda not available
+
+CPU_THREADS = int(os.getenv("CPU_THREADS", "4")) # Default CPU threads
+
+logger.info(f"LLM Configuration: Model Type: {MODEL_TYPE}, Default Model: {DEFAULT_MODEL}")
+logger.info(f"LLM Device: {DEVICE}, GPU Layers: {GPU_LAYERS}, CPU Threads: {CPU_THREADS}")
+
+
+# Login to Hugging Face if token is provided and not using a local model that doesn't need it
+if HF_TOKEN and MODEL_TYPE != "local":
+    logger.info("Logging in to Hugging Face Hub")
+    try:
+        login(token=HF_TOKEN)
+        logger.info("Hugging Face Hub login successful.")
+    except Exception as e:
+        logger.error(f"Hugging Face Hub login failed: {e}", exc_info=True)
+        # Decide if login failure should be a fatal error or allow fallback
+        # For now, just log and continue, relying on fallback mechanisms
+else:
+    logger.info("Skipping Hugging Face Hub login (no token or using local model)")
+
+
+class RAGEngine:
+    """
+    Core RAG engine class for loading models, vector stores, and processing queries.
+    """
+    def __init__(self):
+        self.embeddings = embeddings # Use the globally initialized embeddings model
+        self.llm = self._initialize_llm() # Initialize the language model
+        self.prompt_template = self._create_prompt_template() # Create the main prompt template
+        self.simple_prompt_template = self._create_simple_prompt_template() # Create a simple prompt template
+
+        # Create a modified prompt template for the chain that doesn't require 'instruction'
+        # This is useful if you want a standard RAG chain without the instruction variable
+        chain_template = """You are an AI assistant that provides accurate and helpful information based on the given context.
+
+Context:
+{context}
+
+Question: {query}
+
+Provide a comprehensive answer based on the context provided.
+
+Answer:"""
+
+        chain_prompt = PromptTemplate(
+            input_variables=["context", "query"],
+            template=chain_template
+        )
+
+        # Initialize LangChain LLMChains with appropriate templates
+        # These chains combine the prompt template and the LLM
+        # NOTE: LLMChain is deprecated. Consider migrating to LCEL (LangChain Expression Language)
+        # e.g., chain = prompt | llm
+        self.llm_chain = LLMChain(prompt=chain_prompt, llm=self.llm)
+        self.simple_llm_chain = LLMChain(prompt=self.simple_prompt_template, llm=self.llm)
+
+
+    def _initialize_llm(self):
+        """
+        Initialize the LLM based on MODEL_TYPE configuration.
+        Supports local models (LlamaCpp) and API-based models (HuggingFaceEndpoint).
+        Includes fallback mechanisms.
+        """
+        llm = None # Initialize llm to None
+
+        try:
+            # --- Local Model using llama.cpp ---
+            if MODEL_TYPE == "local":
+                try:
+                    from langchain_community.llms import LlamaCpp
+
+                    model_id = DEFAULT_MODEL
+                    model_basename = MODEL_BASENAME
+                    model_path = os.path.join(MODELS_DIR, model_basename)
+
+                    # Download the model if the file doesn't exist locally
+                    if not os.path.exists(model_path):
+                        logger.info(f"Downloading local model {model_id}/{model_basename} to {MODELS_DIR}...")
+                        from huggingface_hub import hf_hub_download
+                        # hf_hub_download returns the path to the downloaded file
+                        model_path = hf_hub_download(
+                            repo_id=model_id,
+                            filename=model_basename,
+                            cache_dir=MODELS_DIR, # Use MODELS_DIR as the cache directory
+                            resume_download=True # Resume download if interrupted
+                        )
+                        logger.info(f"Model downloaded to {model_path}")
+                    else:
+                        logger.info(f"Local model found at {model_path}, skipping download.")
+
+                    # Initialize the model using LangChain's LlamaCpp wrapper with optimized settings
+                    logger.info(f"Initializing LlamaCpp model from {model_path}")
+
+                    # Determine optimal thread count based on CPU cores if not explicitly set
+                    num_threads = CPU_THREADS
+                    if num_threads <= 0: # If CPU_THREADS is not set or invalid
+                         import multiprocessing
+                         # Estimate physical cores (usually total_cores / 2)
+                         physical_cores = multiprocessing.cpu_count() // 2
+                         # Use between 2 and 4 threads, capped by physical cores
+                         num_threads = min(4, max(2, physical_cores))
+                         logger.info(f"CPU_THREADS not set or invalid, using estimated optimal threads: {num_threads}")
+                    else:
+                         logger.info(f"Using CPU_THREADS from environment: {num_threads}")
+
+
+                    # Configure LlamaCpp with GPU acceleration if available and GPU_LAYERS > 0
+                    gpu_layers = GPU_LAYERS if DEVICE == "cuda" else 0
+
+                    if gpu_layers > 0:
+                        logger.info(f"Using GPU acceleration with {gpu_layers} layers for LlamaCpp")
+                    else:
+                        logger.info("Using CPU-only mode for LlamaCpp")
+
+                    # Get VRAM size to potentially optimize settings further
+                    vram_size_gb = 0
+                    if torch.cuda.is_available():
+                        try:
+                            vram_size_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                            logger.info(f"Detected GPU with {vram_size_gb:.2f} GB VRAM")
+                        except Exception as vram_e:
+                             logger.warning(f"Could not get GPU VRAM size: {vram_e}")
+
+
+                    # Optimize context size (n_ctx) and batch size (n_batch) based on device/VRAM
+                    # These values significantly impact performance and memory usage.
+                    # Adjust these based on your specific GPU and model size.
+                    context_size = 4096 # Default context window size
+                    batch_size = 512 # Default batch size
+
+                    if DEVICE == "cuda" and vram_size_gb > 0:
+                        # Aggressive optimization for 4GB cards like GTX 1650
+                        if vram_size_gb < 5:
+                            context_size = 2048 # Keep context smaller
+                            batch_size = 1024 # Larger batch for throughput
+                            logger.info(f"Optimizing for <5GB VRAM: context_size={context_size}, batch_size={batch_size}")
+                        # Optimization for 8GB cards
+                        elif vram_size_gb < 9:
+                            context_size = 4096 # Standard context
+                            batch_size = 1536 # Increased batch
+                            logger.info(f"Optimizing for 8GB VRAM: context_size={context_size}, batch_size={batch_size}")
+                        # Optimization for 12GB+ cards
+                        else:
+                            context_size = 8192 # Larger context
+                            batch_size = 2048 # Larger batch
+                            logger.info(f"Optimizing for 12GB+ VRAM: context_size={context_size}, batch_size={batch_size}")
+                    elif DEVICE == "cpu":
+                         # Adjust batch size for CPU if needed, typically smaller than GPU
+                         batch_size = min(batch_size, 512) # Keep batch size reasonable for CPU
+                         logger.info(f"Using CPU settings: context_size={context_size}, batch_size={batch_size}, threads={num_threads}")
+
+
+                    llm = LlamaCpp(
+                        model_path=model_path,
+                        temperature=float(os.getenv("LLM_TEMPERATURE", "0.5")), # Use env var, default 0.5
+                        max_tokens=int(os.getenv("LLM_MAX_TOKENS", "1024")), # Use env var, default 1024
+                        top_p=float(os.getenv("LLM_TOP_P", "0.9")), # Use env var, default 0.9
+                        n_ctx=context_size, # Optimized context size
+                        repeat_penalty=float(os.getenv("LLM_REPEAT_PENALTY", "1.1")), # Use env var, default 1.1
+                        n_threads=num_threads, # Optimized thread count
+                        n_batch=batch_size, # Optimized batch size
+                        f16_kv=True, # Use half-precision for key/value cache (saves VRAM/RAM)
+                        verbose=False, # Set to True for more LlamaCpp output
+                        seed=int(os.getenv("LLM_SEED", "42")), # Use env var, default 42
+                        # Stop sequences help the model know when to stop generating
+                        # "Question:" is a good stop sequence for this prompt format
+                        stop=["Question:"], # Removed "\n\n" to allow for paragraph breaks
+                        streaming=True, # Set to True for streaming responses (requires frontend support)
+                        last_n_tokens_size=int(os.getenv("LLM_LAST_N_TOKENS_SIZE", "32")), # Use env var, default 32
+                        use_mlock=os.getenv("LLM_USE_MLOCK", "true").lower() in ("true", "1", "yes"), # Use env var, default true
+                        rope_freq_scale=float(os.getenv("LLM_ROPE_FREQ_SCALE", "0.5")), # Use env var, default 0.5
+                        logits_all=False, # Usually not needed
+                        n_gpu_layers=gpu_layers, # Number of layers to offload to GPU
+                        use_mmap=os.getenv("LLM_USE_MMAP", "true").lower() in ("true", "1", "yes"), # Use env var, default true
+                        offload_kqv=os.getenv("LLM_OFFLOAD_KQV", "true").lower() in ("true", "1", "yes") if DEVICE == "cuda" else False, # Offload KQV to GPU if CUDA
+                        tensor_split=None, # Auto tensor splitting
+                        cache_capacity=None # Use default cache capacity
+                    )
+
+                    logger.info("Successfully initialized LLM with LlamaCpp.")
+                    return llm
+
+                except ImportError:
+                    logger.warning("LlamaCpp not installed. Please install it (`pip install llama-cpp-python`) for local model support.")
+                    # Fall through to fallback options if LlamaCpp is not available
+                except Exception as e:
+                    logger.warning(f"Failed to initialize with LlamaCpp: {e}", exc_info=True)
+                    # Fall through to fallback options on other LlamaCpp errors
+
+            # --- API-based Model (HuggingFaceEndpoint) ---
+            if MODEL_TYPE == "api":
+                # Only use HuggingFaceEndpoint if we have a token
+                if HF_TOKEN:
+                    api_model_id = os.getenv("API_MODEL_ID", "HuggingFaceH4/zephyr-7b-beta")
+                    logger.info(f"Using HuggingFaceEndpoint with model: {api_model_id}")
+                    llm = HuggingFaceEndpoint(
+                        repo_id=api_model_id,
+                        task="text-generation", # Ensure task is correct for the model
+                        max_new_tokens=int(os.getenv("LLM_MAX_TOKENS", "1024")), # Use env var
+                        temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")), # Use env var
+                        top_p=float(os.getenv("LLM_TOP_P", "0.95")), # Use env var
+                        repetition_penalty=float(os.getenv("LLM_REPEAT_PENALTY", "1.15")), # Use env var
+                        huggingfacehub_api_token=HF_TOKEN # Pass token explicitly
+                    )
+                    logger.info("Successfully initialized LLM with HuggingFaceEndpoint.")
+                    return llm
+                else:
+                    logger.error("API model type selected but no HUGGINGFACE_API_TOKEN provided in environment variables.")
+                    # Fall through to fallback if token is missing
+
+            # --- Fallback to HuggingFacePipeline (Transformers) ---
+            # This fallback is useful if LlamaCpp or API models fail/are not configured.
+            # Use a smaller model that is more likely to fit in limited VRAM.
+            logger.info("Falling back to HuggingFacePipeline (Transformers)")
+            try:
+                # Use a model that's better suited for the GTX 1650's 4GB VRAM or CPU
+                model_name = os.getenv("FALLBACK_MODEL_ID", "google/flan-t5-base") # Use env var, default to flan-t5-base
+                logger.info(f"Loading fallback model {model_name} on device: {DEVICE}")
+
+                # Configure model loading with appropriate settings for GPU/CPU
+                # Use device_config for torch_dtype and device_index
+                torch_dtype = device_config.get('torch_dtype', torch.float32) # Default to float32 if not in config
+                device_index = device_config.get('device_index', -1) # Default to -1 (CPU) if not in config
+                device_map = "auto" if DEVICE == "cuda" else None # Use device_map="auto" for GPU
+
+                logger.info(f"Using dtype: {torch_dtype}, device_index: {device_index}, device_map: {device_map}")
+
+                # Load tokenizer
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+                # Load model with optimized settings for GPU/CPU
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    device_map=device_map, # Use device_map for automatic placement
+                    torch_dtype=torch_dtype, # Use configured dtype
+                    low_cpu_mem_usage=True if DEVICE == "cuda" else False # Helps when loading large models with GPU
+                )
+
+                # Create optimized pipeline
+                pipe = pipeline(
+                    "text-generation", # Or "text2text-generation" for T5 models
+                    model=model,
+                    tokenizer=tokenizer,
+                    max_new_tokens=int(os.getenv("LLM_MAX_TOKENS", "1024")), # Use env var
+                    temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")), # Use env var
+                    # device parameter in pipeline can be device_index or device string
+                    # Using device_index from device_config
+                    device=device_index
+                )
+
+                llm = HuggingFacePipeline(pipeline=pipe)
+                logger.info("Successfully initialized fallback model with HuggingFacePipeline.")
+                return llm
+
+            except Exception as fallback_error:
+                logger.error(f"Error initializing fallback model: {fallback_error}", exc_info=True)
+                # Fall through to final mock fallback
+
+        except Exception as e:
+            # Catch any exceptions during the LLM initialization process
+            logger.error(f"An unexpected error occurred during LLM initialization: {e}", exc_info=True)
+            # Final fallback - use a very simple mock LLM
+
+        logger.error("All LLM initialization methods failed. Using a mock LLM.")
+        class MockLLM:
+             """A mock LLM to return an error message if all real LLMs fail."""
+             def __call__(self, prompt: str, **kwargs: Any) -> str:
+                 logger.error("MockLLM called because real LLM failed to load.")
+                 return "I'm sorry, but I couldn't load the language model. Please check your backend configuration and logs."
+
+        return MockLLM()
+
+
+    def _create_prompt_template(self):
+        """
+        Create the main prompt template for the RAG system.
+        This template is used to format the context and query for the LLM.
+        """
+        # Template includes context, query, and an optional instruction
+        template = """You are an AI assistant that provides accurate and helpful information based on the given context.
+
+Context:
+{context}
+
+Question: {query}
+
+{instruction}
+
+Answer:"""
+
+        return PromptTemplate(
+            input_variables=["context", "query", "instruction"],
+            template=template
+        )
+
+    def _create_simple_prompt_template(self):
+        """
+        Create a simple prompt template for faster, more direct responses.
+        Used when 'detailed' is False or in fast mode.
+        """
+        template = """Answer the question based only on the context provided.
+
+Context:
+{context}
+
+Question: {query}
+
+Give a brief, direct answer using only information from the context. Be concise but accurate.
+
+Answer:"""
+
+        return PromptTemplate(
+            input_variables=["context", "query"],
+            template=template
+        )
+
+    def _load_vector_stores(self, document_filter: Optional[List[str]] = None):
+        """
+        Load vector stores for all documents or filtered documents with caching.
+        Vector stores are loaded from the EMBEDDINGS_DIR.
+        """
+        # Initialize cache if not already done
+        if not hasattr(self, '_vector_stores_cache'):
+            self._vector_stores_cache = {}
+
+        # Create a cache key based on the document filter (sorted list of filenames)
+        cache_key = 'all' if not document_filter else ','.join(sorted(document_filter))
+
+        # Check if we have the combined vector stores for this filter in cache
+        if cache_key in self._vector_stores_cache:
+            logger.info(f"Using cached combined vector store for filter: {cache_key}")
+            return self._vector_stores_cache[cache_key]
+
+        # If not cached, load individual vector stores and combine them
+        vector_stores = []
+        logger.info(f"Attempting to load vector stores from {EMBEDDINGS_DIR}")
+
+        # Check if the embeddings directory exists
+        if not os.path.exists(EMBEDDINGS_DIR):
+            logger.warning(f"Embeddings directory {EMBEDDINGS_DIR} does not exist. No documents processed?")
+            return vector_stores # Return empty list if directory doesn't exist
+
+        # Get all potential embedding directories (should correspond to processed documents)
+        embedding_dirs = [d for d in os.listdir(EMBEDDINGS_DIR) if os.path.isdir(os.path.join(EMBEDDINGS_DIR, d))]
+        logger.info(f"Found potential embedding directories: {embedding_dirs}")
+
+        # Filter directories based on document_filter if provided
+        if document_filter and document_filter != ["string"]: # Exclude default "string" value if passed
+            # Extract base names without extensions for filtering (assuming dir names are filename bases)
+            filter_bases = [os.path.splitext(doc)[0] for doc in document_filter]
+            logger.info(f"Filtering embedding directories by document base names: {filter_bases}")
+            embedding_dirs = [d for d in embedding_dirs if d in filter_bases]
+            logger.info(f"Filtered embedding directories to load: {embedding_dirs}")
+        else:
+            logger.info("No document filter applied, attempting to load all available embedding directories.")
+
+        # Load each vector store and combine them into a single searchable index
+        combined_vector_store = None
+
+        for dir_name in embedding_dirs:
+            try:
+                # Check if this individual store is cached
+                store_cache_key = f"store_{dir_name}"
+                if store_cache_key in self._vector_stores_cache:
+                    logger.info(f"Using cached individual vector store: {dir_name}")
+                    vector_store = self._vector_stores_cache[store_cache_key]
+                else:
+                    # Load from disk
+                    vector_store_path = os.path.join(EMBEDDINGS_DIR, dir_name)
+                    logger.info(f"Loading vector store from {vector_store_path}")
+                    # Allow dangerous deserialization as we control the source
+                    vector_store = FAISS.load_local(
+                        vector_store_path,
+                        self.embeddings, # Use the initialized embeddings model
+                        allow_dangerous_deserialization=True
+                    )
+                    # Cache the individual store
+                    self._vector_stores_cache[store_cache_key] = vector_store
+                    logger.info(f"Successfully loaded and cached vector store: {dir_name}")
+
+                # Combine with the main vector store
+                if combined_vector_store is None:
+                    combined_vector_store = vector_store
+                else:
+                    # Use the merge_from method to combine FAISS indices
+                    logger.info(f"Merging vector store {dir_name}")
+                    combined_vector_store.merge_from(vector_store)
+                    logger.info("Merge successful.")
+
+            except Exception as e:
+                logger.error(f"Error loading or merging vector store {dir_name}: {e}", exc_info=True)
+                # Continue loading other stores even if one fails
+
+        # Cache the combined vector store for this filter combination
+        if combined_vector_store is not None:
+             self._vector_stores_cache[cache_key] = combined_vector_store
+             logger.info(f"Cached combined vector store for filter: {cache_key}")
+
+        # Return the combined vector store (or None if none were loaded)
+        # The query method expects a list of stores, so return the combined one in a list
+        return [combined_vector_store] if combined_vector_store else []
+
+
+    def query(
+        self,
+        query: str,
+        document_filter: Optional[List[str]] = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.7,
+        detailed: bool = False,
+        fast_mode: bool = False # Added fast_mode parameter
+    ) -> Dict[str, Any]:
+        """
+        Query the RAG system.
+        Retrieves relevant document chunks and uses an LLM to generate an answer.
+
+        Args:
+            query: The user's query string.
+            document_filter: Optional list of document filenames to search within.
+            max_tokens: Maximum number of tokens for the LLM to generate.
+            temperature: Temperature for LLM text generation (controls randomness).
+            detailed: If True, requests a more detailed answer from the LLM.
+            fast_mode: If True, uses settings optimized for speed (fewer chunks).
+
+        Returns:
+            Dict containing the generated 'answer', list of 'sources', and 'processing_time'.
+        """
+        start_time = time.time()
+        logger.info(f"Starting query process for: '{query}'")
+        if document_filter:
+            logger.info(f"Filtering by documents: {document_filter}")
+        logger.info(f"Parameters: max_tokens={max_tokens}, temperature={temperature}, detailed={detailed}, fast_mode={fast_mode}")
+
+
+        # --- Determine search strategy and parameters ---
+        # Performance optimization - load vector stores
+        # The _load_vector_stores method now handles caching and combining
+        vector_stores_list = self._load_vector_stores(document_filter)
+
+        if not vector_stores_list:
+            logger.warning("No vector stores available for querying.")
+            return {
+                "answer": "No documents have been processed yet. Please upload some documents first.",
+                "sources": [],
+                "processing_time": time.time() - start_time,
+                "is_complex": False # Default complexity
+            }
+
+        # We expect _load_vector_stores to return a list containing one combined store or an empty list
+        combined_vector_store = vector_stores_list[0] # Get the combined store
+
+
+        # Enhanced query complexity detection (moved from __init__ to query method)
+        query_lower = query.lower()
+        query_word_count = len(query.split())
+
+        # Complex query indicators
+        complex_keywords = [
+            "explain", "detail", "elaborate", "comprehensive", "thorough", "in-depth",
+            "compare", "difference", "versus", "how", "why", "analyze", "evaluation",
+            "pros and cons", "advantages", "disadvantages", "implications"
+        ]
+
+        # Question type detection
+        is_what_query = any(query_lower.startswith(starter) for starter in ["what", "which", "who"])
+        is_how_query = any(query_lower.startswith(starter) for starter in ["how", "in what way"])
+        is_why_query = query_lower.startswith("why")
+        is_list_query = any(word in query_lower for word in ["list", "enumerate", "what are"])
+
+        # Determine complexity based on multiple factors
+        has_complex_keywords = any(keyword in query_lower for keyword in complex_keywords)
+        is_complex_query = (
+            detailed or                                # User explicitly requested detailed response
+            query_word_count > 7 or                    # Longer queries tend to be more complex
+            has_complex_keywords or                    # Contains words indicating complexity
+            is_how_query or                            # "How" questions often need detailed explanations
+            is_why_query or                            # "Why" questions require reasoning
+            (is_list_query and not is_what_query)      # List requests except simple "what" questions
+        )
+
+        # Adjust retrieval parameters based on query complexity and fast_mode - optimize for speed
+        if fast_mode:
+             k_value = 1 # Retrieve only the top 1 chunk
+             max_chunks_for_context = 1 # Use only 1 chunk for context
+             logger.info("Fast mode enabled: Retrieving 1 chunk.")
+        elif is_complex_query:
+            k_value = 3     # Retrieve top 3 chunks initially
+            max_chunks_for_context = 3 # Use up to 3 chunks for context
+            logger.info("Complex query detected: Retrieving up to 3 chunks.")
+        else:
+            k_value = 2     # Retrieve top 2 chunks initially
+            max_chunks_for_context = 2 # Use up to 2 chunks for context
+            logger.info("Simple query detected: Retrieving up to 2 chunks.")
+
+
+        logger.info(f"Query complexity: {'Complex' if is_complex_query else 'Simple'}")
+        logger.info(f"Retrieval parameters: k={k_value}, max_chunks_for_context={max_chunks_for_context}")
+
+
+        # --- Retrieve relevant chunks ---
+        all_relevant_chunks = []
+        start_search_time = time.time()
+
+        try:
+            logger.info(f"Searching combined vector store for relevant chunks (k={k_value}).")
+
+            # Use similarity search with score to get relevance scores
+            # This is generally more reliable than MMR for simple cases and provides scores
+            relevant_chunks_with_scores = combined_vector_store.similarity_search_with_score(
+                 query,
+                 k=k_value # Retrieve top k chunks
+             )
+
+            for chunk, score in relevant_chunks_with_scores:
+                 logger.info(f"Retrieved Chunk (score: {score:.4f}): {chunk.metadata.get('source', 'unknown')} - Chunk {chunk.metadata.get('chunk', '?')}")
+                 # Store chunk and its score
+                 all_relevant_chunks.append((chunk, score))
+
+
+            # Sort by relevance score (lower score is better in FAISS)
+            all_relevant_chunks.sort(key=lambda x: x[1])
+
+            # Extract just the chunks (without scores) and take the top N for context
+            # Ensure we don't exceed the number of retrieved chunks
+            top_chunks = [chunk for chunk, _ in all_relevant_chunks][:max_chunks_for_context]
+
+            search_time = time.time() - start_search_time
+            logger.info(f"Search completed in {search_time:.4f} seconds, found {len(top_chunks)} chunks for context.")
+
+            if not top_chunks:
+                logger.warning("No relevant chunks found after search.")
+                return {
+                    "answer": "No relevant information found in the documents.",
+                    "sources": [],
+                    "processing_time": time.time() - start_time,
+                    "is_complex": is_complex_query
+                }
+
+        except Exception as e:
+             logger.error(f"Error during vector store search: {e}", exc_info=True)
+             return {
+                 "answer": f"An error occurred during document search: {str(e)}",
+                 "sources": [],
+                 "processing_time": time.time() - start_time,
+                 "is_complex": is_complex_query
+             }
+
+
+        # --- Prepare context for the LLM ---
+        start_context_time = time.time()
+
+        # Prepare context string by joining the content of the top chunks
+        # Add metadata like filename and chunk number to the context string for the LLM
+        context_parts = []
+        sources_for_frontend = [] # List to send back to the frontend
+
+        for i, chunk in enumerate(top_chunks):
+            # Get metadata safely
+            metadata = chunk.metadata if hasattr(chunk, 'metadata') else {}
+            source_path = metadata.get("source", "unknown_source")
+            chunk_number = metadata.get("chunk", i + 1) # Use index as fallback for chunk number
+
+            # Extract filename from the source path
+            original_filename = os.path.basename(source_path)
+
+            # Format chunk text for the LLM context
+            # Include filename and chunk number for better context awareness by the LLM
+            chunk_text = f"--- Source: {original_filename}, Chunk {chunk_number} ---\n{chunk.page_content.strip()}\n"
+
+            context_parts.append(chunk_text)
+
+            # Prepare source information for the frontend
+            source_info = {
+                 "content": chunk.page_content.strip(), # Send the chunk content
+                 "metadata": {
+                     "original_filename": original_filename, # <--- Include filename here for frontend
+                     "chunk": chunk_number,
+                     # Include other useful metadata if available and desired by frontend
+                     "source_path": source_path # Optional: full path
+                 },
+                 # You could potentially add a relevance score here if needed by frontend
+                 # "score": all_relevant_chunks[i][1] if i < len(all_relevant_chunks) else None
+            }
+            sources_for_frontend.append(source_info)
+
+        context = "\n\n".join(context_parts)
+        context_prep_time = time.time() - start_context_time
+        logger.info(f"Context prepared in {context_prep_time:.4f} seconds.")
+        logger.debug(f"Context sent to LLM:\n{context}")
+
+        # --- Log the sources being sent to the frontend ---
+        logger.info(f"Sources being sent to frontend: {sources_for_frontend}")
+
+
+        # --- Generate answer using the LLM ---
+        start_generation_time = time.time()
+
+        try:
+            # Select the appropriate prompt template based on 'detailed' flag
+            if detailed:
+                # If detailed is requested, use the main prompt template with a specific instruction
+                instruction = "Provide a detailed, comprehensive answer based *only* on the provided context. Include specific details and examples from the text."
+                prompt = self.prompt_template.format(context=context, query=query, instruction=instruction)
+                logger.info("Using detailed prompt.")
+                # Use .invoke() instead of __call__ for the LLM
+                answer = self.llm.invoke(prompt, config={"max_tokens": max_tokens, "temperature": temperature}) # Pass parameters via config
+                logger.info("LLM generation with detailed prompt complete.")
+
+            else:
+                # Use the simple prompt template for concise answers
+                prompt = self.simple_prompt_template.format(context=context, query=query)
+                logger.info("Using simple prompt.")
+                # Use .invoke() on the LLMChain
+                # LLMChain's invoke method expects a dictionary matching prompt input variables
+                answer = self.simple_llm_chain.invoke({"context": context, "query": query}, config={"max_tokens": max_tokens, "temperature": temperature}) # Pass parameters via config
+                # The result from LLMChain.invoke() is a dictionary, extract the 'text' key
+                answer = answer.get('text', str(answer)) # Get 'text' or fallback to string representation
+                logger.info("LLM generation with simple prompt complete.")
+
+            generation_time = time.time() - start_generation_time
+            logger.info(f"LLM generation completed in {generation_time:.4f} seconds.")
+
+            # Clean up the answer string (remove leading/trailing whitespace, potential stop sequences)
+            answer = answer.strip()
+            # Remove the stop sequence "Question:" if it appears at the end of the answer
+            if answer.endswith("Question:"):
+                 answer = answer[:-len("Question:")].strip()
+
+
+        except Exception as e:
+            logger.error(f"Error during LLM generation: {e}", exc_info=True)
+            answer = f"I encountered an error while generating the answer: {str(e)}"
+            sources_for_frontend = [] # Clear sources if generation failed
+
+
+        # --- Final Result ---
+        total_processing_time = time.time() - start_time
+        logger.info(f"Total query processing time: {total_processing_time:.4f} seconds.")
+
+        return {
+            "answer": answer,
+            "sources": sources_for_frontend, # Return the list formatted for the frontend
+            "processing_time": total_processing_time,
+            "is_complex": is_complex_query # Return complexity flag
+        }
+
+# Dependency to get the RAGEngine instance
+# This ensures the RAGEngine is initialized once and reused across requests
+# (assuming your FastAPI app is run with a single worker or managed correctly)
+_rag_engine_instance = None
+
+def get_rag_engine() -> RAGEngine:
+    """
+    Dependency function to provide a singleton instance of RAGEngine.
+    Initializes the engine on the first call.
+    """
+    global _rag_engine_instance
+    if _rag_engine_instance is None:
+        logger.info("Initializing RAGEngine instance...")
+        _rag_engine_instance = RAGEngine()
+        logger.info("RAGEngine instance initialized.")
+    return _rag_engine_instance
